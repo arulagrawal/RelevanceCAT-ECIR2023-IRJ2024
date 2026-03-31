@@ -42,7 +42,15 @@ logging.info("Using device: {}".format(device))
 # Load the SPLADE model
 splade_model_name = "naver/splade-cocondenser-ensembledistil"
 tokenizer = AutoTokenizer.from_pretrained(splade_model_name)
-splade_model = AutoModelForMaskedLM.from_pretrained(splade_model_name).to(device)
+try:
+    splade_model = AutoModelForMaskedLM.from_pretrained(
+        splade_model_name,
+        use_safetensors=True,
+    ).to(device)
+except OSError as err:
+    raise RuntimeError(
+        "SPLADE checkpoint must provide safetensors weights; convert the model or pin a revision that includes them."
+    ) from err
 splade_model.eval()
 
 BATCH_SIZE = 64
