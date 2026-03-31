@@ -7,7 +7,16 @@ and document scores are looked up from the index.
 
 The pre-built index (~5GB) is auto-downloaded on first run.
 """
-import os, tarfile, tqdm, json, numpy as np
+import os, tarfile, tqdm, json, numpy as np, multiprocessing
+# Force safetensors loading to avoid torch.load vulnerability check (needed for PyTorch <2.6)
+os.environ.setdefault("SAFETENSORS_FAST_GPU", "1")
+os.environ.setdefault("HF_SAFETENSORS", "1")
+from transformers import AutoModelForMaskedLM
+# Monkey-patch to force safetensors before Pyserini loads the SPLADE model
+_orig_from_pretrained = AutoModelForMaskedLM.from_pretrained
+AutoModelForMaskedLM.from_pretrained = classmethod(
+    lambda cls, *args, **kwargs: _orig_from_pretrained(*args, **{**kwargs, "use_safetensors": True})
+)
 from pyserini.search.lucene import LuceneImpactSearcher
 from sentence_transformers import LoggingHandler, util
 import logging
@@ -82,35 +91,60 @@ total_pairs = sum(len(dids) for dids in query_doc_pairs.values())
 logging.info("Unique queries: {}  |  Total query-doc pairs: {}".format(len(unique_qids), total_pairs))
 
 # ============================================================
-# Compute SPLADE scores via index search
+# Compute SPLADE scores via batch index search (multi-threaded)
 # ============================================================
 scores_dict_path = os.path.join(CACHE_DIR, "1_splade_scores_train_triples_small_gpu.json")
-logging.info("Computing SPLADE scores via pre-built index...")
+threads = multiprocessing.cpu_count()
+BATCH_CHUNK = 10000  # process 10K queries per batch for resumability
+logging.info("Computing SPLADE scores via pre-built index ({} threads)...".format(threads))
 
-scores_dict = {}
+# Load partial results if resuming
+partial_path = scores_dict_path + ".partial"
+if os.path.exists(partial_path):
+    logging.info("Loading partial results from {}".format(partial_path))
+    with open(partial_path, "r") as f:
+        scores_dict = json.load(f)
+    logging.info("Resuming with {} queries already scored".format(len(scores_dict)))
+else:
+    scores_dict = {}
+
+done_qids = set(scores_dict.keys())
+remaining_qids = [qid for qid in unique_qids if qid not in done_qids]
+logging.info("{} queries remaining".format(len(remaining_qids)))
+
+for chunk_start in tqdm.trange(0, len(remaining_qids), BATCH_CHUNK, desc="SPLADE batch scoring"):
+    chunk_qids = remaining_qids[chunk_start : chunk_start + BATCH_CHUNK]
+    chunk_queries = [queries[qid] for qid in chunk_qids]
+
+    # batch_search parallelizes query encoding + index search across threads
+    results = searcher.batch_search(chunk_queries, chunk_qids, k=1000, threads=threads)
+
+    for qid in chunk_qids:
+        hit_scores = {hit.docid: hit.score for hit in results[qid]}
+        scores_dict[qid] = {}
+        for did in query_doc_pairs[qid]:
+            scores_dict[qid][did] = float(hit_scores.get(did, 0.0))
+
+    # Save partial results after each chunk
+    with open(partial_path, "w") as f:
+        json.dump(scores_dict, f)
+
+# Collect statistics
 all_scores = []
 missing_count = 0
-
-for qid in tqdm.tqdm(unique_qids, desc="SPLADE scoring"):
-    query_text = queries[qid]
-    needed_dids = query_doc_pairs[qid]
-
-    # Search the index — returns scored results for this query
-    hits = searcher.search(query_text, k=1000)
-    hit_scores = {hit.docid: hit.score for hit in hits}
-
-    scores_dict[qid] = {}
-    for did in needed_dids:
-        score = hit_scores.get(did, 0.0)
-        if did not in hit_scores:
+for qid in unique_qids:
+    for did in query_doc_pairs[qid]:
+        score = scores_dict[qid][did]
+        all_scores.append(score)
+        if score == 0.0:
             missing_count += 1
-        scores_dict[qid][did] = float(score)
-        all_scores.append(float(score))
 
 logging.info("Done. {} / {} pairs had no SPLADE score (assigned 0).".format(missing_count, total_pairs))
 
 with open(scores_dict_path, "w+") as fp:
     json.dump(scores_dict, indent=True, fp=fp)
+if os.path.exists(partial_path):
+    os.remove(partial_path)
 logging.info("Saved scores to {}".format(scores_dict_path))
 
 # Print score statistics for normalization calibration
