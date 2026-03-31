@@ -76,7 +76,7 @@ def compute_splade_reps_batched(texts, ids, batch_size=BATCH_SIZE, max_length=12
         ).to(device)
         # autocast only supported on cuda and mps
         use_autocast = isinstance(device, str) and device in ("cuda", "mps")
-        autocast_device = device if isinstance(device, str) else device.type
+        autocast_device = (device if isinstance(device, str) else device.type) if use_autocast else "cpu"
         with torch.no_grad(), torch.amp.autocast(device_type=autocast_device, enabled=use_autocast):
             output = splade_model(**tokens)
         reps = torch.max(
@@ -163,7 +163,7 @@ with open(queries_filepath, "r", encoding="utf8") as fIn:
         queries[qid] = query
 
 train_filepath = os.path.join(
-    data_folder, "bert_cat_ensemble_msmarcopassage_train_scores_ids.tsv?download=1"
+    data_folder, "bert_cat_ensemble_msmarcopassage_train_scores_ids.tsv"
 )
 if not os.path.exists(train_filepath):
     logging.info("Download teacher scores")
