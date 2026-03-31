@@ -1,9 +1,9 @@
 """
 Compute SPLADE scores for MS MARCO training triples using Pyserini's pre-built index.
 
-Uses LuceneImpactSearcher with the pre-built SPLADE index (msmarco-v1-passage.splade-pp-ed)
-so no document encoding is needed. Only queries are encoded (via the SPLADE model),
-and document scores are looked up from the index.
+Two-phase approach:
+  Phase 1: Batch-encode all queries on GPU/MPS (~30 min) — saves to disk, resumable
+  Phase 2: Search pre-built SPLADE index with pre-encoded queries (no BERT needed, fast)
 
 The pre-built index (~5GB) is auto-downloaded on first run.
 """
@@ -11,7 +11,10 @@ import os, tarfile, tqdm, json, numpy as np, multiprocessing
 # Force safetensors loading to avoid torch.load vulnerability check (needed for PyTorch <2.6)
 os.environ.setdefault("SAFETENSORS_FAST_GPU", "1")
 os.environ.setdefault("HF_SAFETENSORS", "1")
-from transformers import AutoModelForMaskedLM
+
+import torch
+from transformers import AutoModelForMaskedLM, AutoTokenizer
+
 # Monkey-patch to force safetensors before Pyserini loads the SPLADE model
 _orig_from_pretrained = AutoModelForMaskedLM.from_pretrained
 AutoModelForMaskedLM.from_pretrained = classmethod(
@@ -28,17 +31,30 @@ logging.basicConfig(
     handlers=[LoggingHandler()],
 )
 
-# Initialize SPLADE searcher with pre-built index
-# Auto-downloads the index and query encoder on first use
-logging.info("Loading pre-built SPLADE index (will download ~5GB on first run)...")
-searcher = LuceneImpactSearcher.from_prebuilt_index(
-    'msmarco-v1-passage.splade-pp-ed',
-    'naver/splade-cocondenser-ensembledistil'
-)
-logging.info("SPLADE searcher ready.")
+# Select device for query encoding
+if torch.cuda.is_available():
+    device = "cuda"
+else:
+    try:
+        import torch_directml
+        device = torch_directml.device()
+    except ImportError:
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+logging.info("Query encoding device: {}".format(device))
 
 CACHE_DIR = "score_files"
 os.makedirs(CACHE_DIR, exist_ok=True)
+BATCH_SIZE = 128
+QUERY_MAX_LENGTH = 64
+ENCODE_CHUNK = 50000   # save encoded queries every 50K for resumability
+SEARCH_CHUNK = 10000   # search 10K queries at a time
+
+# SPLADE quantization parameters (must match Pyserini's SpladeQueryEncoder)
+WEIGHT_RANGE = 5
+QUANT_RANGE = 256
 
 # ============================================================
 # Load MS MARCO data
@@ -46,7 +62,6 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 data_folder = "msmarco-data"
 os.makedirs(data_folder, exist_ok=True)
 
-# Read queries
 queries = {}
 queries_filepath = os.path.join(data_folder, "queries.train.tsv")
 if not os.path.exists(queries_filepath):
@@ -64,7 +79,6 @@ with open(queries_filepath, "r", encoding="utf8") as fIn:
         qid, query = line.strip().split("\t")
         queries[qid] = query
 
-# Read training triples (teacher scores)
 train_filepath = os.path.join(
     data_folder, "bert_cat_ensemble_msmarcopassage_train_scores_ids.tsv"
 )
@@ -75,7 +89,6 @@ if not os.path.exists(train_filepath):
         train_filepath,
     )
 
-# Parse training triples to find all unique query IDs and their associated doc IDs
 logging.info("Parsing training triples...")
 query_doc_pairs = {}  # {qid: set(dids)}
 with open(train_filepath, "rt") as fIn:
@@ -91,41 +104,138 @@ total_pairs = sum(len(dids) for dids in query_doc_pairs.values())
 logging.info("Unique queries: {}  |  Total query-doc pairs: {}".format(len(unique_qids), total_pairs))
 
 # ============================================================
-# Compute SPLADE scores via batch index search (multi-threaded)
+# Phase 1: Batch-encode all queries on GPU
 # ============================================================
+encoded_queries_path = os.path.join(CACHE_DIR, "splade_encoded_queries.json")
+
+if os.path.exists(encoded_queries_path):
+    logging.info("Phase 1 SKIP: encoded queries already exist at {}".format(encoded_queries_path))
+    with open(encoded_queries_path, "r") as f:
+        encoded_queries = json.load(f)
+else:
+    logging.info("Phase 1: Batch-encoding {} queries on {}...".format(len(unique_qids), device))
+
+    splade_model_name = "naver/splade-cocondenser-ensembledistil"
+    tokenizer = AutoTokenizer.from_pretrained(splade_model_name)
+    splade_model = _orig_from_pretrained(splade_model_name, use_safetensors=True).to(device)
+    splade_model.eval()
+
+    reverse_vocab = {v: k for k, v in tokenizer.vocab.items()}
+
+    # Load partial encoded queries if resuming
+    partial_enc_path = encoded_queries_path + ".partial"
+    if os.path.exists(partial_enc_path):
+        with open(partial_enc_path, "r") as f:
+            encoded_queries = json.load(f)
+        logging.info("Resuming with {} queries already encoded".format(len(encoded_queries)))
+    else:
+        encoded_queries = {}
+
+    done_qids = set(encoded_queries.keys())
+    remaining_qids_enc = [qid for qid in unique_qids if qid not in done_qids]
+    logging.info("{} queries remaining to encode".format(len(remaining_qids_enc)))
+
+    for chunk_start in tqdm.trange(0, len(remaining_qids_enc), ENCODE_CHUNK, desc="Phase 1: encoding chunks"):
+        chunk_qids = remaining_qids_enc[chunk_start : chunk_start + ENCODE_CHUNK]
+        chunk_texts = [queries[qid] for qid in chunk_qids]
+
+        # Batch encode on GPU
+        for batch_start in range(0, len(chunk_texts), BATCH_SIZE):
+            batch_texts = chunk_texts[batch_start : batch_start + BATCH_SIZE]
+            batch_qids = chunk_qids[batch_start : batch_start + BATCH_SIZE]
+
+            tokens = tokenizer(
+                batch_texts, return_tensors="pt", truncation=True,
+                max_length=QUERY_MAX_LENGTH, padding=True, add_special_tokens=True,
+            ).to(device)
+
+            with torch.no_grad():
+                logits = splade_model(**tokens)["logits"]
+
+            # SPLADE aggregation: max over tokens of log(1 + ReLU(logits))
+            reps = torch.max(
+                torch.log(1 + torch.relu(logits)) * tokens["attention_mask"].unsqueeze(-1),
+                dim=1,
+            )[0].cpu().numpy()
+
+            # Convert to quantized {term: weight} dicts (matching Pyserini format)
+            for i, qid in enumerate(batch_qids):
+                nonzero = np.nonzero(reps[i])[0]
+                weights = reps[i][nonzero]
+                encoded_queries[qid] = {
+                    reverse_vocab[int(idx)]: int(round(float(w) / WEIGHT_RANGE * QUANT_RANGE))
+                    for idx, w in zip(nonzero, weights)
+                }
+
+        # Save partial after each chunk
+        with open(partial_enc_path, "w") as f:
+            json.dump(encoded_queries, f)
+
+    # Save final and clean up
+    with open(encoded_queries_path, "w") as f:
+        json.dump(encoded_queries, f)
+    if os.path.exists(partial_enc_path):
+        os.remove(partial_enc_path)
+
+    # Free GPU memory
+    del splade_model, tokenizer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    logging.info("Phase 1 done: encoded {} queries".format(len(encoded_queries)))
+
+# ============================================================
+# Phase 2: Search pre-built index with pre-encoded queries
+# ============================================================
+logging.info("Phase 2: Loading pre-built SPLADE index...")
+searcher = LuceneImpactSearcher.from_prebuilt_index(
+    'msmarco-v1-passage.splade-pp-ed',
+    'naver/splade-cocondenser-ensembledistil'
+)
+# Get IDF info and min_idf from the searcher for filtering
+min_idf = searcher.min_idf
+idf = searcher.idf
+logging.info("SPLADE index ready. Searching with pre-encoded queries...")
+
 scores_dict_path = os.path.join(CACHE_DIR, "1_splade_scores_train_triples_small_gpu.json")
 threads = multiprocessing.cpu_count()
-BATCH_CHUNK = 10000  # process 10K queries per batch for resumability
-logging.info("Computing SPLADE scores via pre-built index ({} threads)...".format(threads))
 
 # Load partial results if resuming
 partial_path = scores_dict_path + ".partial"
 if os.path.exists(partial_path):
-    logging.info("Loading partial results from {}".format(partial_path))
     with open(partial_path, "r") as f:
         scores_dict = json.load(f)
-    logging.info("Resuming with {} queries already scored".format(len(scores_dict)))
+    logging.info("Resuming search with {} queries already scored".format(len(scores_dict)))
 else:
     scores_dict = {}
 
 done_qids = set(scores_dict.keys())
 remaining_qids = [qid for qid in unique_qids if qid not in done_qids]
-logging.info("{} queries remaining".format(len(remaining_qids)))
+logging.info("{} queries remaining to search".format(len(remaining_qids)))
 
-for chunk_start in tqdm.trange(0, len(remaining_qids), BATCH_CHUNK, desc="SPLADE batch scoring"):
-    chunk_qids = remaining_qids[chunk_start : chunk_start + BATCH_CHUNK]
-    chunk_queries = [queries[qid] for qid in chunk_qids]
+# Import Java types for passing encoded queries to Lucene
+from pyserini.pyclass import autoclass
+JHashMap = autoclass('java.util.HashMap')
+JInt = autoclass('java.lang.Integer')
 
-    # batch_search parallelizes query encoding + index search across threads
-    results = searcher.batch_search(chunk_queries, chunk_qids, k=1000, threads=threads)
+for chunk_start in tqdm.trange(0, len(remaining_qids), SEARCH_CHUNK, desc="Phase 2: searching"):
+    chunk_qids = remaining_qids[chunk_start : chunk_start + SEARCH_CHUNK]
 
     for qid in chunk_qids:
-        hit_scores = {hit.docid: hit.score for hit in results[qid]}
+        # Build Java HashMap from pre-encoded query (matching Pyserini's internal format)
+        jquery = JHashMap()
+        for token, weight in encoded_queries[qid].items():
+            if token in idf and idf[token] > min_idf:
+                jquery.put(token, JInt(int(weight)))
+
+        hits = searcher.object.search(jquery, 1000)
+        hit_scores = {hit.docid: hit.score for hit in hits}
+
         scores_dict[qid] = {}
         for did in query_doc_pairs[qid]:
             scores_dict[qid][did] = float(hit_scores.get(did, 0.0))
 
-    # Save partial results after each chunk
+    # Save partial results
     with open(partial_path, "w") as f:
         json.dump(scores_dict, f)
 
