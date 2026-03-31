@@ -185,20 +185,19 @@ else:
     logging.info("Phase 1 done: encoded {} queries".format(len(encoded_queries)))
 
 # ============================================================
-# Phase 2: Search pre-built index with pre-encoded queries
+# Phase 2: Batch search pre-built index with pre-encoded queries
 # ============================================================
 logging.info("Phase 2: Loading pre-built SPLADE index...")
 searcher = LuceneImpactSearcher.from_prebuilt_index(
     'msmarco-v1-passage.splade-pp-ed',
     'naver/splade-cocondenser-ensembledistil'
 )
-# Get IDF info and min_idf from the searcher for filtering
 min_idf = searcher.min_idf
 idf = searcher.idf
-logging.info("SPLADE index ready. Searching with pre-encoded queries...")
 
 scores_dict_path = os.path.join(CACHE_DIR, "1_splade_scores_train_triples_small_gpu.json")
 threads = multiprocessing.cpu_count()
+logging.info("SPLADE index ready. Batch searching with {} threads...".format(threads))
 
 # Load partial results if resuming
 partial_path = scores_dict_path + ".partial"
@@ -213,24 +212,35 @@ done_qids = set(scores_dict.keys())
 remaining_qids = [qid for qid in unique_qids if qid not in done_qids]
 logging.info("{} queries remaining to search".format(len(remaining_qids)))
 
-# Import Java types for passing encoded queries to Lucene
+# Import Java types for batch search
 from pyserini.pyclass import autoclass
 JHashMap = autoclass('java.util.HashMap')
 JInt = autoclass('java.lang.Integer')
+JArrayList = autoclass('java.util.ArrayList')
+JString = autoclass('java.lang.String')
 
-for chunk_start in tqdm.trange(0, len(remaining_qids), SEARCH_CHUNK, desc="Phase 2: searching"):
+for chunk_start in tqdm.trange(0, len(remaining_qids), SEARCH_CHUNK, desc="Phase 2: batch searching"):
     chunk_qids = remaining_qids[chunk_start : chunk_start + SEARCH_CHUNK]
 
+    # Build Java ArrayLists for batch search
+    query_lst = JArrayList()
+    qid_lst = JArrayList()
     for qid in chunk_qids:
-        # Build Java HashMap from pre-encoded query (matching Pyserini's internal format)
         jquery = JHashMap()
         for token, weight in encoded_queries[qid].items():
             if token in idf and idf[token] > min_idf:
                 jquery.put(token, JInt(int(weight)))
+        query_lst.add(jquery)
+        qid_lst.add(JString(qid))
 
-        hits = searcher.object.search(jquery, 1000)
+    # Java-side multi-threaded batch search — no Python loop overhead
+    results = searcher.object.batch_search(query_lst, qid_lst, 1000, threads)
+
+    # Extract results back to Python
+    for entry in results.entrySet().toArray():
+        qid = entry.getKey()
+        hits = entry.getValue()
         hit_scores = {hit.docid: hit.score for hit in hits}
-
         scores_dict[qid] = {}
         for did in query_doc_pairs[qid]:
             scores_dict[qid][did] = float(hit_scores.get(did, 0.0))
