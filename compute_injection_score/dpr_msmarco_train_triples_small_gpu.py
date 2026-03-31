@@ -33,7 +33,7 @@ if not os.path.exists(collection_filepath):
     if not os.path.exists(tar_filepath):
         logging.info("Download collection.tar.gz")
         util.http_get(
-            "https://msmarco.blob.core.windows.net/msmarcoranking/collection.tar.gz",
+            "https://msmarco.z22.web.core.windows.net/msmarcoranking/collection.tar.gz",
             tar_filepath,
         )
     with tarfile.open(tar_filepath, "r:gz") as tar:
@@ -50,7 +50,7 @@ if not os.path.exists(queries_filepath):
     if not os.path.exists(tar_filepath):
         logging.info("Download queries.tar.gz")
         util.http_get(
-            "https://msmarco.blob.core.windows.net/msmarcoranking/queries.tar.gz",
+            "https://msmarco.z22.web.core.windows.net/msmarcoranking/queries.tar.gz",
             tar_filepath,
         )
     with tarfile.open(tar_filepath, "r:gz") as tar:

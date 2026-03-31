@@ -1,20 +1,12 @@
 """
-This examples show how to train a Cross-Encoder for the MS Marco dataset (https://github.com/microsoft/MSMARCO-Passage-Ranking).
+This script trains a Cross-Encoder for the MS Marco dataset using knowledge distillation
+with SPLADE score injection (SPLADECAT).
 
-In this example we use a knowledge distillation setup. Sebastian Hofstätter et al. trained in https://arxiv.org/abs/2010.02666
-an ensemble of large Transformer models for the MS MARCO datasets and combines the scores from a BERT-base, BERT-large, and ALBERT-large model.
-
-We use the logits scores from the ensemble to train a smaller model. We found that the MiniLM model gives the best performance while
-offering the highest speed.
-
-The resulting Cross-Encoder can then be used for passage re-ranking: You retrieve for example 100 passages
-for a given query, for example with ElasticSearch, and pass the query+retrieved_passage to the CrossEncoder
-for scoring. You sort the results then according to the output of the CrossEncoder.
-
-This gives a significant boost compared to out-of-the-box ElasticSearch / BM25 ranking.
+Based on train_cross-encoder_kd_bm25cat.py, but uses SPLADE scores instead of BM25.
+SPLADE scores are injected as text prefix to the query: "{score} [SEP] {query}".
 
 Running this script:
-python train_cross-encoder-v2.py
+python train_cross-encoder_kd_spladecat.py
 """
 from torch.utils.data import DataLoader
 from sentence_transformers import LoggingHandler, util
@@ -29,25 +21,31 @@ import tarfile
 import tqdm
 import torch
 import json
-global_min_bm25 = 0
-global_max_bm25 = 50
-scores_path = "/ivi/ilps/personal/aaskari/minilmv3/msmarco-data/injection_scores/1_bm25_scores_train_triples_small.json"
-scores = json.loads(open(scores_path, "r").read())
-for qid in tqdm.tqdm(scores.keys(), desc = "reading scores...{}".format(scores_path)):
-  for did, score in scores[qid].items():
-    normalized_score = (score - global_min_bm25) / (global_max_bm25 - global_min_bm25)
-    normalized_score = int(normalized_score * 100)
-    scores[qid][did] = normalized_score
 
-validation_scores_path = "/ivi/ilps/personal/aaskari/minilmv3/msmarco-data/injection_scores/5_bm25_scores_train-eval_triples.json"
+# SPLADE normalization constants
+# TODO: Update these after running splade_msmarco_train_triples_small_gpu.py
+# and analyzing the score distribution (see printed statistics at the end of that script)
+global_min_splade = 0
+global_max_splade = 200  # initial estimate; update based on empirical P99
+
+scores_path = "compute_injection_score/score_files/1_splade_scores_train_triples_small_gpu.json"
+scores = json.loads(open(scores_path, "r").read())
+for qid in tqdm.tqdm(scores.keys(), desc="reading scores...{}".format(scores_path)):
+    for did, score in scores[qid].items():
+        normalized_score = (score - global_min_splade) / (global_max_splade - global_min_splade)
+        normalized_score = int(normalized_score * 100)
+        scores[qid][did] = normalized_score
+
+validation_scores_path = "compute_injection_score/score_files/5_splade_scores_train-eval_triples.json"
 scores_validation = json.loads(open(validation_scores_path, "r").read())
-for qid in tqdm.tqdm(scores_validation.keys(), desc = "reading validation scores...{}".format(validation_scores_path)):
-  if qid not in scores:
-    scores[qid] = {}
-  for did, score in scores_validation[qid].items():
-    normalized_score = (score - global_min_bm25) / (global_max_bm25 - global_min_bm25)
-    normalized_score = int(normalized_score * 100)
-    scores[qid][did] = normalized_score
+for qid in tqdm.tqdm(scores_validation.keys(), desc="reading validation scores...{}".format(validation_scores_path)):
+    if qid not in scores:
+        scores[qid] = {}
+    for did, score in scores_validation[qid].items():
+        normalized_score = (score - global_min_splade) / (global_max_splade - global_min_splade)
+        normalized_score = int(normalized_score * 100)
+        scores[qid][did] = normalized_score
+
 #### Just some code to print debug information to stdout
 logging.basicConfig(format='%(asctime)s - %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',
@@ -56,15 +54,14 @@ logging.basicConfig(format='%(asctime)s - %(message)s',
 #### /print debug information to stdout
 
 
-#First, we define the transformer model we want to fine-tune
+# First, we define the transformer model we want to fine-tune
 model_name = 'microsoft/MiniLM-L12-H384-uncased'
 train_batch_size = 32
 num_epochs = 1
-model_save_path = 'finetuned_CEs/train-cross-encoder-kd-bm25cat-'+model_name.replace("/", "-")+'-'+datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+model_save_path = 'finetuned_CEs/train-cross-encoder-kd-spladecat-' + model_name.replace("/", "-") + '-' + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
-
-#We set num_labels=1 and set the activation function to Identiy, so that we get the raw logits
+# We set num_labels=1 and set the activation function to Identity, so that we get the raw logits
 model = CrossEncoder(model_name, num_labels=1, max_length=512, default_activation_function=torch.nn.Identity())
 
 
@@ -110,7 +107,7 @@ with open(queries_filepath, 'r', encoding='utf8') as fIn:
         queries[qid] = query
 
 
-### Now we create our  dev data
+### Now we create our dev data
 train_samples = []
 dev_samples = {}
 
@@ -119,12 +116,9 @@ dev_samples = {}
 num_dev_queries = 200
 num_max_dev_negatives = 200
 
-# msmarco-qidpidtriples.rnd-shuf.train-eval.tsv.gz and msmarco-qidpidtriples.rnd-shuf.train.tsv.gz is a randomly
-# shuffled version of qidpidtriples.train.full.2.tsv.gz from the MS Marco website
-# We extracted in the train-eval split 500 random queries that can be used for evaluation during training
 train_eval_filepath = os.path.join(data_folder, 'msmarco-qidpidtriples.rnd-shuf.train-eval.tsv.gz')
 if not os.path.exists(train_eval_filepath):
-    logging.info("Download "+os.path.basename(train_eval_filepath))
+    logging.info("Download " + os.path.basename(train_eval_filepath))
     util.http_get('https://sbert.net/datasets/msmarco-qidpidtriples.rnd-shuf.train-eval.tsv.gz', train_eval_filepath)
 
 with gzip.open(train_eval_filepath, 'rt') as fIn:
@@ -156,7 +150,7 @@ with open(teacher_logits_filepath) as fIn:
     for line in fIn:
         pos_score, neg_score, qid, pid1, pid2 = line.strip().split("\t")
 
-        if qid in dev_qids: #Skip queries in our dev dataset
+        if qid in dev_qids:  # Skip queries in our dev dataset
             continue
 
         train_samples.append(InputExample(texts=["{} [SEP] {}".format(scores[qid][pid1], queries[qid]), corpus[pid1]], label=float(pos_score)))
@@ -166,7 +160,6 @@ with open(teacher_logits_filepath) as fIn:
 train_dataloader = DataLoader(train_samples, shuffle=True, batch_size=train_batch_size, drop_last=True)
 
 # We add an evaluator, which evaluates the performance during training
-# It performs a classification task and measures scores like F1 (finding relevant passages) and Average Precision
 evaluator = CERerankingEvaluator(dev_samples, name='train-eval')
 
 # Configure the training
@@ -185,5 +178,5 @@ model.fit(train_dataloader=train_dataloader,
           optimizer_params={'lr': 7e-6},
           use_amp=True)
 
-#Save latest model
-model.save(model_save_path+'-latest')
+# Save latest model
+model.save(model_save_path + '-latest')

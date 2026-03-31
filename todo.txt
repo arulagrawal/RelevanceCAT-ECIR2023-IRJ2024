@@ -1,0 +1,24 @@
+Score Computation (in compute_injection_score/):
+1. splade_msmarco_train_triples_small_gpu.py — Computes SPLADE scores for all training
+triples using naver/splade-cocondenser-ensembledistil. Features doc rep caching, partial
+result saving for resumability, and prints score statistics at the end for calibrating
+normalization constants.
+2. splade_msmarco_validation_set.py — Computes SPLADE scores for the 500-query validation
+split.
+3. splade_msmarco_trec19.py — Computes SPLADE scores for TREC DL'19 top-1000 candidates.
+
+Training (in train/):
+4. train_cross-encoder_kd_spladecat.py — KD training with SPLADE injection. Identical to
+BM25CAT except it loads SPLADE score files and uses SPLADE normalization constants.
+
+Evaluation (in evaluation/):
+5. eval_trec19-MiniLM-L-12-spladecat.py — Evaluates SPLADECAT on TREC DL'19 with NDCG@10,
+MAP, and Recall metrics.
+
+Before Running
+
+1. Run the score computation scripts first (step 1 is the longest — needs GPU)
+2. After step 1 completes, check the printed score statistics and update global_min_splade /
+ global_max_splade in both the training and evaluation scripts (initial estimate: 0 and 200)
+3. Update model_name in the eval script to point to the actual trained model directory after
+ training completes
