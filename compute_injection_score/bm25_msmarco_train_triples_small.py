@@ -4,7 +4,7 @@ import tarfile
 import tqdm
 import os
 import json
-from pyserini.index.lucene import IndexReader
+from pyserini.index.lucene import LuceneIndexReader as IndexReader
 from pyserini import analysis, search
 from pyserini.pyclass import autoclass
 import logging
@@ -16,8 +16,7 @@ logging.basicConfig(format='%(asctime)s - %(message)s',
                     handlers=[LoggingHandler()])
 #### /print debug information to stdout
 
-index_path = 'indexes/lucene-index-msmarco-passage' #lucene-index.cacm
-index_reader = IndexReader(index_path)
+index_reader = IndexReader.from_prebuilt_index('msmarco-v1-passage')
 b = 0.68
 k1 = 0.82
 similarity_bm25 = autoclass('org.apache.lucene.search.similarities.BM25Similarity')(k1, b)
