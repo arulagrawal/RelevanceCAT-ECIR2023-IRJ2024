@@ -76,7 +76,8 @@ def compute_splade_reps_batched(texts, ids, batch_size=BATCH_SIZE, max_length=12
         ).to(device)
         # autocast only supported on cuda and mps
         use_autocast = isinstance(device, str) and device in ("cuda", "mps")
-        with torch.no_grad(), torch.amp.autocast(device_type=device, enabled=use_autocast):
+        autocast_device = device if isinstance(device, str) else device.type
+        with torch.no_grad(), torch.amp.autocast(device_type=autocast_device, enabled=use_autocast):
             output = splade_model(**tokens)
         reps = torch.max(
             torch.log(1 + torch.relu(output.logits))
