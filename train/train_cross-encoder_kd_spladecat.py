@@ -26,7 +26,7 @@ import json
 global_min_splade = 0
 global_max_splade = 125807  # P99 of training scores
 
-scores_path = "compute_injection_score/score_files/1_splade_scores_train_triples_small_gpu.json"
+scores_path = "score_files/1_splade_scores_train_triples_small_gpu.json"
 scores = json.loads(open(scores_path, "r").read())
 for qid in tqdm.tqdm(scores.keys(), desc="reading scores...{}".format(scores_path)):
     for did, score in scores[qid].items():
@@ -34,7 +34,7 @@ for qid in tqdm.tqdm(scores.keys(), desc="reading scores...{}".format(scores_pat
         normalized_score = int(normalized_score * 100)
         scores[qid][did] = normalized_score
 
-validation_scores_path = "compute_injection_score/score_files/5_splade_scores_train-eval_triples.json"
+validation_scores_path = "score_files/5_splade_scores_train-eval_triples.json"
 scores_validation = json.loads(open(validation_scores_path, "r").read())
 for qid in tqdm.tqdm(scores_validation.keys(), desc="reading validation scores...{}".format(validation_scores_path)):
     if qid not in scores:
