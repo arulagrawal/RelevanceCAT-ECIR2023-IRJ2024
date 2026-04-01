@@ -57,7 +57,7 @@ logging.info("Parsing top-1000 file...")
 unique_queries = {}   # {qid: query_text}
 query_doc_pairs = {}  # {qid: set(pids)}
 
-with open(top1000_filepath) as fIn:
+with open(top1000_filepath, encoding='utf-8') as fIn:
     for line in tqdm.tqdm(fIn, unit_scale=True, desc="parsing top-1000"):
         qid, pid, query, passage = line.strip().split("\t")
         unique_queries[qid] = query
