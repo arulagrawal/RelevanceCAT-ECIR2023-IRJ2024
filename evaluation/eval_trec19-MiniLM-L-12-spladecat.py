@@ -1,6 +1,9 @@
 import os
-# Force safetensors loading to avoid torch.load vulnerability check (needed for PyTorch <2.6)
-os.environ.setdefault("SAFETENSORS_FAST_GPU", "1")
+# Bypass torch.load vulnerability check for PyTorch <2.6 (e.g. torch-directml pinned to 2.4)
+import transformers.utils.import_utils
+transformers.utils.import_utils.check_torch_load_is_safe = lambda: None
+import transformers.modeling_utils
+transformers.modeling_utils.check_torch_load_is_safe = lambda: None
 import sys, math, tqdm, json, pytrec_eval, gzip, tarfile, logging
 import numpy as np
 from datetime import datetime

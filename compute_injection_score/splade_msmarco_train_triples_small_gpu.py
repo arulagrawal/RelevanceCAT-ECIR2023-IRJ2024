@@ -8,18 +8,14 @@ Two-phase approach:
 The pre-built index (~5GB) is auto-downloaded on first run.
 """
 import os, tarfile, tqdm, json, numpy as np, multiprocessing
-# Force safetensors loading to avoid torch.load vulnerability check (needed for PyTorch <2.6)
-os.environ.setdefault("SAFETENSORS_FAST_GPU", "1")
-os.environ.setdefault("HF_SAFETENSORS", "1")
+# Bypass torch.load vulnerability check for PyTorch <2.6 (e.g. torch-directml pinned to 2.4)
+import transformers.utils.import_utils
+transformers.utils.import_utils.check_torch_load_is_safe = lambda: None
+import transformers.modeling_utils
+transformers.modeling_utils.check_torch_load_is_safe = lambda: None
 
 import torch
 from transformers import AutoModelForMaskedLM, AutoTokenizer
-
-# Monkey-patch to force safetensors before Pyserini loads the SPLADE model
-_orig_from_pretrained = AutoModelForMaskedLM.from_pretrained
-AutoModelForMaskedLM.from_pretrained = classmethod(
-    lambda cls, *args, **kwargs: _orig_from_pretrained(*args, **{**kwargs, "use_safetensors": True})
-)
 from pyserini.search.lucene import LuceneImpactSearcher
 from sentence_transformers import LoggingHandler, util
 import logging

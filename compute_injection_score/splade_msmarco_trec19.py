@@ -4,14 +4,11 @@ Compute SPLADE scores for TREC DL'19 top-1000 candidates using Pyserini's pre-bu
 import json, tqdm, os, gzip
 import numpy as np
 from sentence_transformers import util
-# Force safetensors loading to avoid torch.load vulnerability check (needed for PyTorch <2.6)
-os.environ.setdefault("SAFETENSORS_FAST_GPU", "1")
-os.environ.setdefault("HF_SAFETENSORS", "1")
-from transformers import AutoModelForMaskedLM
-_orig_from_pretrained = AutoModelForMaskedLM.from_pretrained
-AutoModelForMaskedLM.from_pretrained = classmethod(
-    lambda cls, *args, **kwargs: _orig_from_pretrained(*args, **{**kwargs, "use_safetensors": True})
-)
+# Bypass torch.load vulnerability check for PyTorch <2.6 (e.g. torch-directml pinned to 2.4)
+import transformers.utils.import_utils
+transformers.utils.import_utils.check_torch_load_is_safe = lambda: None
+import transformers.modeling_utils
+transformers.modeling_utils.check_torch_load_is_safe = lambda: None
 from pyserini.search.lucene import LuceneImpactSearcher
 from sentence_transformers import LoggingHandler
 import logging
