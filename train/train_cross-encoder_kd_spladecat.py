@@ -14,11 +14,13 @@ import transformers.utils.import_utils
 transformers.utils.import_utils.check_torch_load_is_safe = lambda: None
 import transformers.modeling_utils
 transformers.modeling_utils.check_torch_load_is_safe = lambda: None
-from torch.utils.data import DataLoader
 from sentence_transformers import LoggingHandler, util
 from sentence_transformers.cross_encoder import CrossEncoder
+from sentence_transformers.cross_encoder.trainer import CrossEncoderTrainer
+from sentence_transformers.cross_encoder.training_args import CrossEncoderTrainingArguments
+from sentence_transformers.cross_encoder.losses import MSELoss as CEMSELoss
 from CERerankingEvaluator_bm25cat import CERerankingEvaluator
-from sentence_transformers import InputExample
+from datasets import Dataset
 import logging
 from datetime import datetime
 import gzip
@@ -157,50 +159,80 @@ with gzip.open(train_eval_filepath, 'rt') as fIn:
 
 dev_qids = set(dev_samples.keys())
 
-# Read our training file
-# As input examples, we provide the (query, passage) pair together with the logits score from the teacher ensemble
+# Write pre-processed training data to disk instead of holding 800K InputExample objects in RAM
 teacher_logits_filepath = os.path.join(data_folder, 'bert_cat_ensemble_msmarcopassage_train_scores_ids.tsv')
-train_samples = []
 if not os.path.exists(teacher_logits_filepath):
     util.http_get('https://zenodo.org/record/4068216/files/bert_cat_ensemble_msmarcopassage_train_scores_ids.tsv?download=1', teacher_logits_filepath)
 
-with open(teacher_logits_filepath) as fIn:
-    for line in fIn:
-        pos_score, neg_score, qid, pid1, pid2 = line.strip().split("\t")
+train_data_path = os.path.join(data_folder, 'spladecat_train_data.tsv')
+if os.path.exists(train_data_path):
+    logging.info("SKIP: {} already exists".format(train_data_path))
+else:
+    logging.info("Writing pre-processed training data to {}...".format(train_data_path))
+    num_train_samples = 0
+    with open(teacher_logits_filepath, encoding='utf8') as fIn, open(train_data_path, 'w', encoding='utf8') as fOut:
+        for line in fIn:
+            pos_score, neg_score, qid, pid1, pid2 = line.strip().split("\t")
+            if qid in dev_qids:
+                continue
+            q1 = "{} [SEP] {}".format(scores[qid][pid1], queries[qid])
+            q2 = "{} [SEP] {}".format(scores[qid][pid2], queries[qid])
+            fOut.write("{}\t{}\t{}\n".format(q1, corpus[pid1], pos_score))
+            fOut.write("{}\t{}\t{}\n".format(q2, corpus[pid2], neg_score))
+            num_train_samples += 2
+    logging.info("Wrote {} training samples to disk".format(num_train_samples))
 
-        if qid in dev_qids:  # Skip queries in our dev dataset
-            continue
-
-        train_samples.append(InputExample(texts=["{} [SEP] {}".format(scores[qid][pid1], queries[qid]), corpus[pid1]], label=float(pos_score)))
-        train_samples.append(InputExample(texts=["{} [SEP] {}".format(scores[qid][pid2], queries[qid]), corpus[pid2]], label=float(neg_score)))
-
-# Free large intermediate data structures before model training
+# Free all large data structures
 import gc
 del corpus, queries, scores
 gc.collect()
-logging.info("Freed corpus/queries/scores from memory. train_samples: {}".format(len(train_samples)))
+logging.info("Freed corpus/queries/scores from memory")
 
-# We create a DataLoader to load our train samples
-train_dataloader = DataLoader(train_samples, shuffle=True, batch_size=train_batch_size, drop_last=True)
+# Build HF Dataset from TSV file (memory-mapped Arrow format — not held in RAM)
+logging.info("Building HF Dataset from {}...".format(train_data_path))
 
-# We add an evaluator, which evaluates the performance during training
+
+def generate_examples():
+    with open(train_data_path, 'r', encoding='utf8') as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) == 3:
+                yield {"sentence1": parts[0], "sentence2": parts[1], "label": float(parts[2])}
+
+
+train_dataset = Dataset.from_generator(generate_examples)
+logging.info("Dataset ready: {} samples".format(len(train_dataset)))
+
+# Configure training with CrossEncoderTrainer (modern API, memory-efficient)
 evaluator = CERerankingEvaluator(dev_samples, name='train-eval')
 
-# Configure the training
-warmup_steps = 5000
-logging.info("Warmup-steps: {}".format(warmup_steps))
+args = CrossEncoderTrainingArguments(
+    output_dir=model_save_path,
+    num_train_epochs=num_epochs,
+    per_device_train_batch_size=train_batch_size,
+    warmup_steps=5000,
+    learning_rate=7e-6,
+    fp16=True,
+    eval_strategy="steps",
+    eval_steps=5000,
+    save_strategy="steps",
+    save_steps=5000,
+    load_best_model_at_end=True,
+    max_grad_norm=1.0,
+    weight_decay=0.01,
+)
 
+trainer = CrossEncoderTrainer(
+    model=model,
+    args=args,
+    train_dataset=train_dataset,
+    loss=CEMSELoss(model),
+    evaluator=[evaluator],
+)
 
-# Train the model
-model.fit(train_dataloader=train_dataloader,
-          loss_fct=torch.nn.MSELoss(),
-          evaluator=evaluator,
-          epochs=num_epochs,
-          evaluation_steps=5000,
-          warmup_steps=warmup_steps,
-          output_path=model_save_path,
-          optimizer_params={'lr': 7e-6},
-          use_amp=True)
+logging.info("starting training")
+trainer.train()
+logging.info("saving model")
 
-# Save latest model
+# Save final model
 model.save(model_save_path + '-latest')

@@ -1,6 +1,7 @@
 torch
 transformers
 sentence-transformers
+datasets
 numpy
 scipy
 pyserini

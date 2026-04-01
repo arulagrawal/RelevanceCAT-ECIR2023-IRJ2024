@@ -11,7 +11,10 @@
       "Bash(.venv/bin/python -c \"\nfrom pyserini.search.lucene import LuceneImpactSearcher\nimport inspect\nsrc = inspect.getsource\\(LuceneImpactSearcher.batch_search\\)\nprint\\(src\\)\n\" 2>&1)",
       "Bash(ls msmarco-data/*2019* msmarco-data/*test* msmarco-data/*top1000*)",
       "Bash(ls msmarco-data/collection_truncated.tsv msmarco-data/2019qrels* msmarco-data/msmarco-test2019*)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(.venv/bin/python -c \"\nfrom sentence_transformers.cross_encoder import CrossEncoder\nimport inspect\nsrc = inspect.getsource\\(CrossEncoder.fit\\)\nprint\\(src[:5000]\\)\n\" 2>&1)",
+      "Bash(.venv/bin/python -c \"\nfrom sentence_transformers.cross_encoder import losses\nprint\\(dir\\(losses\\)\\)\n\" 2>&1)",
+      "Bash(.venv/bin/python -c \":*)"
     ]
   }
 }
