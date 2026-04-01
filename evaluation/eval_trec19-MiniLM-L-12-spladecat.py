@@ -1,4 +1,7 @@
-import sys, math, tqdm, json, pytrec_eval, gzip, os, tarfile, logging
+import os
+# Force safetensors loading to avoid torch.load vulnerability check (needed for PyTorch <2.6)
+os.environ.setdefault("SAFETENSORS_FAST_GPU", "1")
+import sys, math, tqdm, json, pytrec_eval, gzip, tarfile, logging
 import numpy as np
 from datetime import datetime
 from torch.utils.data import DataLoader

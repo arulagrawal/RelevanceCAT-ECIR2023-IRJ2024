@@ -8,6 +8,9 @@ SPLADE scores are injected as text prefix to the query: "{score} [SEP] {query}".
 Running this script:
 python train_cross-encoder_kd_spladecat.py
 """
+import os
+# Force safetensors loading to avoid torch.load vulnerability check (needed for PyTorch <2.6)
+os.environ.setdefault("SAFETENSORS_FAST_GPU", "1")
 from torch.utils.data import DataLoader
 from sentence_transformers import LoggingHandler, util
 from sentence_transformers.cross_encoder import CrossEncoder
