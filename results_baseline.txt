@@ -1,0 +1,2 @@
+metrics eval:  map_cut.1000: 0.3401231066401454 | ndcg_cut.10: 0.5150230881768976 | recall.10: 0.11570707679059244 | 
+measures_results:  {'map_cut.1000': np.float64(0.3401231066401454), 'ndcg_cut.10': np.float64(0.5150230881768976), 'recall.10': np.float64(0.11570707679059244)}
