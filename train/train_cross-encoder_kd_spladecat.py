@@ -174,6 +174,12 @@ with open(teacher_logits_filepath) as fIn:
         train_samples.append(InputExample(texts=["{} [SEP] {}".format(scores[qid][pid1], queries[qid]), corpus[pid1]], label=float(pos_score)))
         train_samples.append(InputExample(texts=["{} [SEP] {}".format(scores[qid][pid2], queries[qid]), corpus[pid2]], label=float(neg_score)))
 
+# Free large intermediate data structures before model training
+import gc
+del corpus, queries, scores
+gc.collect()
+logging.info("Freed corpus/queries/scores from memory. train_samples: {}".format(len(train_samples)))
+
 # We create a DataLoader to load our train samples
 train_dataloader = DataLoader(train_samples, shuffle=True, batch_size=train_batch_size, drop_last=True)
 
