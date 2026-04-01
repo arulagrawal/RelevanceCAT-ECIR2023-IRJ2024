@@ -58,6 +58,20 @@ logging.basicConfig(format='%(asctime)s - %(message)s',
 #### /print debug information to stdout
 
 
+# Select device: CUDA > DirectML (AMD on Windows) > MPS (Apple Silicon) > CPU
+if torch.cuda.is_available():
+    device = "cuda"
+else:
+    try:
+        import torch_directml
+        device = str(torch_directml.device())
+    except ImportError:
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+logging.info("Using device: {}".format(device))
+
 # First, we define the transformer model we want to fine-tune
 model_name = 'microsoft/MiniLM-L12-H384-uncased'
 train_batch_size = 32
@@ -66,7 +80,7 @@ model_save_path = 'finetuned_CEs/train-cross-encoder-kd-spladecat-' + model_name
 
 
 # We set num_labels=1 and set the activation function to Identity, so that we get the raw logits
-model = CrossEncoder(model_name, num_labels=1, max_length=512, default_activation_function=torch.nn.Identity())
+model = CrossEncoder(model_name, num_labels=1, max_length=512, default_activation_function=torch.nn.Identity(), device=device)
 
 
 ### Now we read the MS Marco dataset
