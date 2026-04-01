@@ -23,7 +23,7 @@ scores_path = injection_scores_path + "3_trec19_splade_scores.json"
 
 # SPLADE normalization constants - must match training script!
 global_min_splade = 0
-global_max_splade = 200  # TODO: update based on empirical analysis
+global_max_splade = 125807  # P99 of training scores
 
 pos_neg_ratio = 4
 max_train_samples = 0 # full train set

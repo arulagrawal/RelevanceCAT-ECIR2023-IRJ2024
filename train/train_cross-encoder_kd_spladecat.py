@@ -22,11 +22,9 @@ import tqdm
 import torch
 import json
 
-# SPLADE normalization constants
-# TODO: Update these after running splade_msmarco_train_triples_small_gpu.py
-# and analyzing the score distribution (see printed statistics at the end of that script)
+# SPLADE normalization constants (from empirical score distribution)
 global_min_splade = 0
-global_max_splade = 200  # initial estimate; update based on empirical P99
+global_max_splade = 125807  # P99 of training scores
 
 scores_path = "compute_injection_score/score_files/1_splade_scores_train_triples_small_gpu.json"
 scores = json.loads(open(scores_path, "r").read())
