@@ -1,8 +1,9 @@
 """
 Compute SPLADE scores for TREC DL'19 top-1000 candidates using Pyserini's pre-built index.
 """
-import json, tqdm, os
+import json, tqdm, os, gzip
 import numpy as np
+from sentence_transformers import util
 # Force safetensors loading to avoid torch.load vulnerability check (needed for PyTorch <2.6)
 os.environ.setdefault("SAFETENSORS_FAST_GPU", "1")
 os.environ.setdefault("HF_SAFETENSORS", "1")
@@ -35,8 +36,22 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # Parse top-1000 file to find unique queries and their documents
 # ============================================================
 data_folder = 'msmarco-data'
+os.makedirs(data_folder, exist_ok=True)
 filename = "msmarco-passagetest2019-top1000.tsv"
 top1000_filepath = os.path.join(data_folder, filename)
+
+# Auto-download if missing
+if not os.path.exists(top1000_filepath):
+    gz_filepath = top1000_filepath + ".gz"
+    if not os.path.exists(gz_filepath):
+        logging.info("Downloading msmarco-passagetest2019-top1000.tsv.gz...")
+        util.http_get(
+            "https://msmarco.z22.web.core.windows.net/msmarcoranking/msmarco-passagetest2019-top1000.tsv.gz",
+            gz_filepath,
+        )
+    logging.info("Extracting {}...".format(gz_filepath))
+    with gzip.open(gz_filepath, 'rb') as f_in, open(top1000_filepath, 'wb') as f_out:
+        f_out.write(f_in.read())
 
 logging.info("Parsing top-1000 file...")
 unique_queries = {}   # {qid: query_text}

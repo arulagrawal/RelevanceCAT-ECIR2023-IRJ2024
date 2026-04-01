@@ -36,6 +36,29 @@ max_length_query = 30
 max_length_passage = 200
 model_max_length = 230 + 3 + 3 # 3:[cls]query[sep]doc[sep]. 3 extra tokens for injection: score normally takes two tokens, plus one [sep]
 
+# Auto-download TREC DL'19 evaluation files if missing
+os.makedirs(base_path, exist_ok=True)
+
+if not os.path.exists(top100_run_path):
+    gz_path = top100_run_path + ".gz"
+    if not os.path.exists(gz_path):
+        logging.info("Downloading msmarco-passagetest2019-top1000.tsv.gz...")
+        util.http_get("https://msmarco.z22.web.core.windows.net/msmarcoranking/msmarco-passagetest2019-top1000.tsv.gz", gz_path)
+    with gzip.open(gz_path, 'rb') as f_in, open(top100_run_path, 'wb') as f_out:
+        f_out.write(f_in.read())
+
+if not os.path.exists(queries_path):
+    gz_path = queries_path + ".gz"
+    if not os.path.exists(gz_path):
+        logging.info("Downloading msmarco-test2019-queries.tsv.gz...")
+        util.http_get("https://msmarco.z22.web.core.windows.net/msmarcoranking/msmarco-test2019-queries.tsv.gz", gz_path)
+    with gzip.open(gz_path, 'rb') as f_in, open(queries_path, 'wb') as f_out:
+        f_out.write(f_in.read())
+
+if not os.path.exists(qrel_path):
+    logging.info("Downloading 2019qrels-pass.txt...")
+    util.http_get("https://trec.nist.gov/data/deep/2019qrels-pass.txt", qrel_path)
+
 print("fine_tuned_model_path {} | model_max_length {} | queries_path {} | ranking_output_path {} ".format(fine_tuned_model_path, model_max_length, queries_path, ranking_output_path))
 
 scores = json.loads(open(scores_path, "r").read())

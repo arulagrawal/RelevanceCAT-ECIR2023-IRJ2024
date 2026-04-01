@@ -8,7 +8,10 @@
       "Bash(.venv/bin/python -c \"\nfrom pyserini.encode._splade import SpladeQueryEncoder\nimport inspect\nprint\\(inspect.getsource\\(SpladeQueryEncoder.encode\\)\\)\n\" 2>&1)",
       "Bash(.venv/bin/python -c \"\nfrom pyserini.encode._splade import SpladeQueryEncoder\nimport inspect\nprint\\(inspect.getsource\\(SpladeQueryEncoder._output_to_weight_dicts\\)\\)\nprint\\('---'\\)\nprint\\(inspect.getsource\\(SpladeQueryEncoder._get_encoded_query_token_wight_dicts\\)\\)\n\" 2>&1)",
       "Bash(.venv/bin/python -c \"\nfrom pyserini.search.lucene._impact_searcher import LuceneImpactSearcher\nimport inspect\nsrc = inspect.getsource\\(LuceneImpactSearcher.search\\)\nprint\\(src[:2000]\\)\n\" 2>&1)",
-      "Bash(.venv/bin/python -c \"\nfrom pyserini.search.lucene import LuceneImpactSearcher\nimport inspect\nsrc = inspect.getsource\\(LuceneImpactSearcher.batch_search\\)\nprint\\(src\\)\n\" 2>&1)"
+      "Bash(.venv/bin/python -c \"\nfrom pyserini.search.lucene import LuceneImpactSearcher\nimport inspect\nsrc = inspect.getsource\\(LuceneImpactSearcher.batch_search\\)\nprint\\(src\\)\n\" 2>&1)",
+      "Bash(ls msmarco-data/*2019* msmarco-data/*test* msmarco-data/*top1000*)",
+      "Bash(ls msmarco-data/collection_truncated.tsv msmarco-data/2019qrels* msmarco-data/msmarco-test2019*)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }
