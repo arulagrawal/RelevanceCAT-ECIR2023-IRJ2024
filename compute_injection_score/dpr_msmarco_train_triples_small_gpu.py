@@ -3,7 +3,7 @@ import torch
 torch.set_default_tensor_type(torch.cuda.FloatTensor)
 import os, tarfile, tqdm, os, json
 from sentence_transformers import SentenceTransformer, util
-from pyserini.index.lucene import IndexReader
+from pyserini.index.lucene import LuceneIndexReader as IndexReader
 from pyserini import analysis, search
 from pyserini.pyclass import autoclass
 import logging

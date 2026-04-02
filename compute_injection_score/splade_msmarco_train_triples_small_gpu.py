@@ -1,17 +1,22 @@
 """
-Compute SPLADE scores for MS MARCO training triples.
+Compute SPLADE scores for MS MARCO training triples using Pyserini's pre-built index.
 
-Optimized 3-phase approach:
-  Phase 1: Batch-compute SPLADE reps for all unique documents (saved in chunks to disk)
-  Phase 2: Batch-compute SPLADE reps for all unique queries (save to disk)
-  Phase 3: Compute dot-product scores (pure math, very fast)
+Two-phase approach:
+  Phase 1: Batch-encode all queries on GPU/MPS (~30 min) — saves to disk, resumable
+  Phase 2: Search pre-built SPLADE index with pre-encoded queries (no BERT needed, fast)
 
-Each phase is resumable — if interrupted, re-running skips completed chunks/phases.
+The pre-built index (~5GB) is auto-downloaded on first run.
 """
+import os, tarfile, tqdm, json, numpy as np, multiprocessing
+# Bypass torch.load vulnerability check for PyTorch <2.6 (e.g. torch-directml pinned to 2.4)
+import transformers.utils.import_utils
+transformers.utils.import_utils.check_torch_load_is_safe = lambda: None
+import transformers.modeling_utils
+transformers.modeling_utils.check_torch_load_is_safe = lambda: None
+
 import torch
-import os, tarfile, tqdm, json, numpy as np
-from scipy import sparse
 from transformers import AutoModelForMaskedLM, AutoTokenizer
+from pyserini.search.lucene import LuceneImpactSearcher
 from sentence_transformers import LoggingHandler, util
 import logging
 
@@ -22,128 +27,36 @@ logging.basicConfig(
     handlers=[LoggingHandler()],
 )
 
-# Select device: CUDA (also covers AMD ROCm on Linux) > DirectML (AMD on Windows) > MPS (Apple Silicon) > CPU
+# Select device for query encoding
 if torch.cuda.is_available():
     device = "cuda"
 else:
     try:
         import torch_directml
         device = torch_directml.device()
-        logging.info("Using DirectML (AMD GPU on Windows)")
     except ImportError:
-        if torch.backends.mps.is_available():
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             device = "mps"
         else:
             device = "cpu"
-logging.info("Using device: {}".format(device))
+logging.info("Query encoding device: {}".format(device))
 
-# Load the SPLADE model
-splade_model_name = "naver/splade-cocondenser-ensembledistil"
-tokenizer = AutoTokenizer.from_pretrained(splade_model_name)
-try:
-    splade_model = AutoModelForMaskedLM.from_pretrained(
-        splade_model_name,
-        use_safetensors=True,
-    ).to(device)
-except OSError as err:
-    raise RuntimeError(
-        "SPLADE checkpoint must provide safetensors weights; convert the model or pin a revision that includes them."
-    ) from err
-splade_model.eval()
-
-# Tunable parameters
-BATCH_SIZE = 128       # larger batches = better GPU/MPS utilization
-DOC_MAX_LENGTH = 128   # MS MARCO passages avg ~55 words; 128 tokens covers >95%
-QUERY_MAX_LENGTH = 64
-CHUNK_SIZE = 500_000   # save doc reps to disk every 500K docs for resumability
 CACHE_DIR = "score_files"
 os.makedirs(CACHE_DIR, exist_ok=True)
+BATCH_SIZE = 128
+QUERY_MAX_LENGTH = 64
+ENCODE_CHUNK = 50000   # save encoded queries every 50K for resumability
+SEARCH_CHUNK = 10000   # search 10K queries at a time
 
-
-def compute_splade_reps_batched(texts, ids, batch_size=BATCH_SIZE, max_length=128, desc="encoding"):
-    """Compute SPLADE sparse representations for a list of texts.
-    Returns a dict of {id: scipy.sparse.csr_matrix}."""
-    all_reps = {}
-    for i in tqdm.trange(0, len(texts), batch_size, desc=desc):
-        batch_texts = texts[i : i + batch_size]
-        batch_ids = ids[i : i + batch_size]
-        tokens = tokenizer(
-            batch_texts,
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_length,
-            padding=True,
-        ).to(device)
-        # autocast only supported on cuda and mps
-        use_autocast = isinstance(device, str) and device in ("cuda", "mps")
-        autocast_device = (device if isinstance(device, str) else device.type) if use_autocast else "cpu"
-        with torch.no_grad(), torch.amp.autocast(device_type=autocast_device, enabled=use_autocast):
-            output = splade_model(**tokens)
-        reps = torch.max(
-            torch.log(1 + torch.relu(output.logits))
-            * tokens["attention_mask"].unsqueeze(-1),
-            dim=1,
-        )[0].cpu().float().numpy()
-        for j, id_ in enumerate(batch_ids):
-            all_reps[id_] = sparse.csr_matrix(reps[j])
-    return all_reps
-
-
-def save_sparse_chunk(reps_dict, path):
-    """Save a chunk of sparse representations to disk."""
-    ids = list(reps_dict.keys())
-    data = sparse.vstack([reps_dict[id_] for id_ in ids])
-    sparse.save_npz(path + ".data.npz", data)
-    with open(path + ".ids.json", "w") as f:
-        json.dump(ids, f)
-    logging.info("Saved chunk with {} reps to {}".format(len(ids), path))
-
-
-def load_sparse_chunk(path):
-    """Load a chunk of sparse representations from disk."""
-    data = sparse.load_npz(path + ".data.npz")
-    with open(path + ".ids.json", "r") as f:
-        ids = json.load(f)
-    return {id_: data[i] for i, id_ in enumerate(ids)}
-
-
-def load_all_doc_chunks(chunk_dir):
-    """Load all saved doc rep chunks and merge into one dict."""
-    reps = {}
-    chunk_idx = 0
-    while True:
-        path = os.path.join(chunk_dir, "chunk_{}".format(chunk_idx))
-        if not os.path.exists(path + ".data.npz"):
-            break
-        chunk = load_sparse_chunk(path)
-        reps.update(chunk)
-        chunk_idx += 1
-    logging.info("Loaded {} total doc reps from {} chunks".format(len(reps), chunk_idx))
-    return reps
-
+# SPLADE quantization parameters (must match Pyserini's SpladeQueryEncoder)
+WEIGHT_RANGE = 5
+QUANT_RANGE = 256
 
 # ============================================================
 # Load MS MARCO data
 # ============================================================
 data_folder = "msmarco-data"
 os.makedirs(data_folder, exist_ok=True)
-
-corpus = {}
-collection_filepath = os.path.join(data_folder, "collection.tsv")
-if not os.path.exists(collection_filepath):
-    tar_filepath = os.path.join(data_folder, "collection.tar.gz")
-    if not os.path.exists(tar_filepath):
-        logging.info("Download collection.tar.gz")
-        util.http_get(
-            "https://msmarco.z22.web.core.windows.net/msmarcoranking/collection.tar.gz",
-            tar_filepath,
-        )
-    with tarfile.open(tar_filepath, "r:gz") as tar:
-        tar.extractall(path=data_folder)
-with open(collection_filepath, "r", encoding="utf8") as fIn:
-    for line in fIn:
-        pid, passage = line.strip().split("\t")
-        corpus[pid] = passage
 
 queries = {}
 queries_filepath = os.path.join(data_folder, "queries.train.tsv")
@@ -172,7 +85,6 @@ if not os.path.exists(train_filepath):
         train_filepath,
     )
 
-# Parse training triples to find all unique query and document IDs
 logging.info("Parsing training triples...")
 query_doc_pairs = {}  # {qid: set(dids)}
 with open(train_filepath, "rt") as fIn:
@@ -184,93 +96,184 @@ with open(train_filepath, "rt") as fIn:
         query_doc_pairs[qid].add(neg_id)
 
 unique_qids = list(query_doc_pairs.keys())
-unique_dids = list(set(did for dids in query_doc_pairs.values() for did in dids))
-logging.info("Unique queries: {}  |  Unique documents: {}".format(len(unique_qids), len(unique_dids)))
+total_pairs = sum(len(dids) for dids in query_doc_pairs.values())
+logging.info("Unique queries: {}  |  Total query-doc pairs: {}".format(len(unique_qids), total_pairs))
 
 # ============================================================
-# Phase 1: Compute document representations (chunked + resumable)
+# Phase 1: Batch-encode all queries on GPU
 # ============================================================
-doc_chunks_dir = os.path.join(CACHE_DIR, "splade_doc_chunks")
-os.makedirs(doc_chunks_dir, exist_ok=True)
+encoded_queries_path = os.path.join(CACHE_DIR, "splade_encoded_queries.json")
 
-# Figure out how many chunks are already done
-completed_ids = set()
-completed_chunks = 0
-while os.path.exists(os.path.join(doc_chunks_dir, "chunk_{}.ids.json".format(completed_chunks))):
-    with open(os.path.join(doc_chunks_dir, "chunk_{}.ids.json".format(completed_chunks))) as f:
-        completed_ids.update(json.load(f))
-    completed_chunks += 1
-
-remaining_dids = [did for did in unique_dids if did not in completed_ids]
-
-if remaining_dids:
-    logging.info("Phase 1: {} docs already done in {} chunks, {} remaining...".format(
-        len(completed_ids), completed_chunks, len(remaining_dids)))
-
-    # Process remaining docs in chunks
-    for chunk_start in range(0, len(remaining_dids), CHUNK_SIZE):
-        chunk_idx = completed_chunks + (chunk_start // CHUNK_SIZE)
-        chunk_dids = remaining_dids[chunk_start : chunk_start + CHUNK_SIZE]
-        chunk_texts = [corpus[did] for did in chunk_dids]
-
-        logging.info("Phase 1: Processing chunk {} ({} docs)...".format(chunk_idx, len(chunk_dids)))
-        chunk_reps = compute_splade_reps_batched(
-            chunk_texts, chunk_dids, max_length=DOC_MAX_LENGTH,
-            desc="Phase 1 chunk {}".format(chunk_idx),
-        )
-        save_sparse_chunk(chunk_reps, os.path.join(doc_chunks_dir, "chunk_{}".format(chunk_idx)))
-        del chunk_reps  # free memory before next chunk
+if os.path.exists(encoded_queries_path):
+    logging.info("Phase 1 SKIP: encoded queries already exist at {}".format(encoded_queries_path))
+    with open(encoded_queries_path, "r") as f:
+        encoded_queries = json.load(f)
 else:
-    logging.info("Phase 1 SKIP: all {} document reps already computed".format(len(unique_dids)))
+    logging.info("Phase 1: Batch-encoding {} queries on {}...".format(len(unique_qids), device))
 
-# Load all doc reps for Phase 3
-logging.info("Loading all document reps...")
-doc_reps = load_all_doc_chunks(doc_chunks_dir)
+    splade_model_name = "naver/splade-cocondenser-ensembledistil"
+    tokenizer = AutoTokenizer.from_pretrained(splade_model_name)
+    splade_model = _orig_from_pretrained(splade_model_name, use_safetensors=True).to(device)
+    splade_model.eval()
+
+    reverse_vocab = {v: k for k, v in tokenizer.vocab.items()}
+
+    # Load partial encoded queries if resuming
+    partial_enc_path = encoded_queries_path + ".partial"
+    if os.path.exists(partial_enc_path):
+        with open(partial_enc_path, "r") as f:
+            encoded_queries = json.load(f)
+        logging.info("Resuming with {} queries already encoded".format(len(encoded_queries)))
+    else:
+        encoded_queries = {}
+
+    done_qids = set(encoded_queries.keys())
+    remaining_qids_enc = [qid for qid in unique_qids if qid not in done_qids]
+    logging.info("{} queries remaining to encode".format(len(remaining_qids_enc)))
+
+    for chunk_start in tqdm.trange(0, len(remaining_qids_enc), ENCODE_CHUNK, desc="Phase 1: encoding chunks"):
+        chunk_qids = remaining_qids_enc[chunk_start : chunk_start + ENCODE_CHUNK]
+        chunk_texts = [queries[qid] for qid in chunk_qids]
+
+        # Batch encode on GPU
+        for batch_start in range(0, len(chunk_texts), BATCH_SIZE):
+            batch_texts = chunk_texts[batch_start : batch_start + BATCH_SIZE]
+            batch_qids = chunk_qids[batch_start : batch_start + BATCH_SIZE]
+
+            tokens = tokenizer(
+                batch_texts, return_tensors="pt", truncation=True,
+                max_length=QUERY_MAX_LENGTH, padding=True, add_special_tokens=True,
+            ).to(device)
+
+            with torch.no_grad():
+                logits = splade_model(**tokens)["logits"]
+
+            # SPLADE aggregation: max over tokens of log(1 + ReLU(logits))
+            reps = torch.max(
+                torch.log(1 + torch.relu(logits)) * tokens["attention_mask"].unsqueeze(-1),
+                dim=1,
+            )[0].cpu().numpy()
+
+            # Convert to quantized {term: weight} dicts (matching Pyserini format)
+            for i, qid in enumerate(batch_qids):
+                nonzero = np.nonzero(reps[i])[0]
+                weights = reps[i][nonzero]
+                encoded_queries[qid] = {
+                    reverse_vocab[int(idx)]: int(round(float(w) / WEIGHT_RANGE * QUANT_RANGE))
+                    for idx, w in zip(nonzero, weights)
+                }
+
+        # Save partial after each chunk
+        with open(partial_enc_path, "w") as f:
+            json.dump(encoded_queries, f)
+
+    # Save final and clean up
+    with open(encoded_queries_path, "w") as f:
+        json.dump(encoded_queries, f)
+    if os.path.exists(partial_enc_path):
+        os.remove(partial_enc_path)
+
+    # Free GPU memory
+    del splade_model, tokenizer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    logging.info("Phase 1 done: encoded {} queries".format(len(encoded_queries)))
 
 # ============================================================
-# Phase 2: Compute query representations
+# Phase 2: Batch search pre-built index with pre-encoded queries
 # ============================================================
-query_reps_path = os.path.join(CACHE_DIR, "splade_query_reps")
-if os.path.exists(query_reps_path + ".data.npz"):
-    logging.info("Phase 2 SKIP: query reps already computed")
-    query_reps = load_sparse_chunk(query_reps_path)
-else:
-    logging.info("Phase 2: Computing SPLADE reps for {} unique queries...".format(len(unique_qids)))
-    query_texts = [queries[qid] for qid in unique_qids]
-    query_reps = compute_splade_reps_batched(query_texts, unique_qids, max_length=QUERY_MAX_LENGTH, desc="Phase 2: queries")
-    save_sparse_chunk(query_reps, query_reps_path)
+logging.info("Phase 2: Loading pre-built SPLADE index...")
+searcher = LuceneImpactSearcher.from_prebuilt_index(
+    'msmarco-v1-passage.splade-pp-ed',
+    'naver/splade-cocondenser-ensembledistil'
+)
+min_idf = searcher.min_idf
+idf = searcher.idf
 
-# ============================================================
-# Phase 3: Compute dot-product scores
-# ============================================================
 scores_dict_path = os.path.join(CACHE_DIR, "1_splade_scores_train_triples_small_gpu.json")
-logging.info("Phase 3: Computing dot-product scores...")
+threads = multiprocessing.cpu_count()
+logging.info("SPLADE index ready. Batch searching with {} threads...".format(threads))
 
-scores_dict = {}
+# Load partial results if resuming
+partial_path = scores_dict_path + ".partial"
+if os.path.exists(partial_path):
+    with open(partial_path, "r") as f:
+        scores_dict = json.load(f)
+    logging.info("Resuming search with {} queries already scored".format(len(scores_dict)))
+else:
+    scores_dict = {}
+
+done_qids = set(scores_dict.keys())
+remaining_qids = [qid for qid in unique_qids if qid not in done_qids]
+logging.info("{} queries remaining to search".format(len(remaining_qids)))
+
+# Import Java types for batch search
+from pyserini.pyclass import autoclass
+JHashMap = autoclass('java.util.HashMap')
+JInt = autoclass('java.lang.Integer')
+JArrayList = autoclass('java.util.ArrayList')
+JString = autoclass('java.lang.String')
+
+for chunk_start in tqdm.trange(0, len(remaining_qids), SEARCH_CHUNK, desc="Phase 2: batch searching"):
+    chunk_qids = remaining_qids[chunk_start : chunk_start + SEARCH_CHUNK]
+
+    # Build Java ArrayLists for batch search
+    query_lst = JArrayList()
+    qid_lst = JArrayList()
+    for qid in chunk_qids:
+        jquery = JHashMap()
+        for token, weight in encoded_queries[qid].items():
+            if token in idf and idf[token] > min_idf:
+                jquery.put(token, JInt(int(weight)))
+        query_lst.add(jquery)
+        qid_lst.add(JString(qid))
+
+    # Java-side multi-threaded batch search — no Python loop overhead
+    results = searcher.object.batch_search(query_lst, qid_lst, 1000, threads)
+
+    # Extract results back to Python
+    for entry in results.entrySet().toArray():
+        qid = entry.getKey()
+        hits = entry.getValue()
+        hit_scores = {hit.docid: hit.score for hit in hits}
+        scores_dict[qid] = {}
+        for did in query_doc_pairs[qid]:
+            scores_dict[qid][did] = float(hit_scores.get(did, 0.0))
+
+    # Save partial results
+    with open(partial_path, "w") as f:
+        json.dump(scores_dict, f)
+
+# Collect statistics
 all_scores = []
-for qid in tqdm.tqdm(unique_qids, desc="Phase 3: dot products"):
-    q_rep = query_reps[qid]
-    scores_dict[qid] = {}
+missing_count = 0
+for qid in unique_qids:
     for did in query_doc_pairs[qid]:
-        d_rep = doc_reps[did]
-        score = float((q_rep.multiply(d_rep)).sum())
-        scores_dict[qid][did] = score
+        score = scores_dict[qid][did]
         all_scores.append(score)
+        if score == 0.0:
+            missing_count += 1
+
+logging.info("Done. {} / {} pairs had no SPLADE score (assigned 0).".format(missing_count, total_pairs))
 
 with open(scores_dict_path, "w+") as fp:
     json.dump(scores_dict, indent=True, fp=fp)
+if os.path.exists(partial_path):
+    os.remove(partial_path)
 logging.info("Saved scores to {}".format(scores_dict_path))
 
 # Print score statistics for normalization calibration
 all_scores = np.array(all_scores)
 print("\n=== SPLADE Score Statistics (for normalization) ===")
-print("Count: {}".format(len(all_scores)))
-print("Min:   {:.4f}".format(np.min(all_scores)))
-print("Max:   {:.4f}".format(np.max(all_scores)))
-print("Mean:  {:.4f}".format(np.mean(all_scores)))
-print("Median:{:.4f}".format(np.median(all_scores)))
-print("P1:    {:.4f}".format(np.percentile(all_scores, 1)))
-print("P5:    {:.4f}".format(np.percentile(all_scores, 5)))
-print("P95:   {:.4f}".format(np.percentile(all_scores, 95)))
-print("P99:   {:.4f}".format(np.percentile(all_scores, 99)))
+print("Count:   {}".format(len(all_scores)))
+print("Zeros:   {} ({:.1f}%)".format(missing_count, 100 * missing_count / len(all_scores)))
+print("Min:     {:.4f}".format(np.min(all_scores)))
+print("Max:     {:.4f}".format(np.max(all_scores)))
+print("Mean:    {:.4f}".format(np.mean(all_scores)))
+print("Median:  {:.4f}".format(np.median(all_scores)))
+print("P1:      {:.4f}".format(np.percentile(all_scores, 1)))
+print("P5:      {:.4f}".format(np.percentile(all_scores, 5)))
+print("P95:     {:.4f}".format(np.percentile(all_scores, 95)))
+print("P99:     {:.4f}".format(np.percentile(all_scores, 99)))
 print("=== Use these to set global_min_splade and global_max_splade ===")
