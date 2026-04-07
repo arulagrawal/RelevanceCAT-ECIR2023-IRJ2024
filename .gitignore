@@ -2,3 +2,4 @@
 msmarco-data/
 .direnv/
 .env
+train/finetuned_CEs/
